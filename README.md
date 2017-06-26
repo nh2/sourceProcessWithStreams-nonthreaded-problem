@@ -12,7 +12,7 @@ It hangs without `-threaded`. (I'm running without `-threaded` to check for some
 
 I think I know what the problem is:
 
-The `streamingProcess` that it calls from `streaming-commons` does:
+The [`streamingProcess`](https://github.com/fpco/streaming-commons/blob/276be069fc130f2457a667ade56343ea8e9492ac/Data/Streaming/Process.hs#L166) that it calls from `streaming-commons` does:
 
 ```haskell
     _ <- forkIOWithUnmask $ \_unmask -> try (waitForProcess ph)
