@@ -5,16 +5,60 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# OPTIONS_GHC -Wall #-}
 
+import           Control.Concurrent (forkIOWithUnmask)
 import           Control.Concurrent.Async
-import           Control.Exception (finally, onException)
+import           Control.Concurrent.STM
+import           Control.Exception
 import           Control.Monad.IO.Class
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import           Data.Conduit
 import qualified Data.Conduit.List as CL
-import           Data.Conduit.Process hiding (sourceProcessWithStreams)
+import           Data.Conduit.Process hiding (sourceProcessWithStreams, streamingProcess)
+import           Data.Maybe (fromMaybe)
+import           Data.Streaming.Process hiding (streamingProcess)
+import           Data.Streaming.Process.Internal
 import           Say
 import           System.Exit
+import           System.IO (hClose)
+import qualified System.Process.Internals        as PI
+
+streamingProcess :: (MonadIO m, InputSource stdin, OutputSink stdout, OutputSink stderr)
+               => CreateProcess
+               -> m (stdin, stdout, stderr, StreamingProcessHandle)
+streamingProcess cp = liftIO $ do
+    let (getStdin, stdinStream) = isStdStream
+        (getStdout, stdoutStream) = osStdStream
+        (getStderr, stderrStream) = osStdStream
+
+    (stdinH, stdoutH, stderrH, ph) <- PI.createProcess_ "streamingProcess" cp
+        { std_in = fromMaybe (std_in cp) stdinStream
+        , std_out = fromMaybe (std_out cp) stdoutStream
+        , std_err = fromMaybe (std_err cp) stderrStream
+        }
+
+    ec <- atomically newEmptyTMVar
+    -- Apparently waitForProcess can throw an exception itself when
+    -- delegate_ctlc is True, so to avoid this TMVar from being left empty, we
+    -- capture any exceptions and store them as an impure exception in the
+    -- TMVar
+    _ <- forkIOWithUnmask $ \_unmask -> try (waitForProcess ph)
+        >>= atomically
+          . putTMVar ec
+          . either
+              (throw :: SomeException -> a)
+              id
+
+    let close =
+            mclose stdinH `finally` mclose stdoutH `finally` mclose stderrH
+          where
+            mclose = maybe (return ()) hClose
+
+    (,,,)
+        <$> getStdin stdinH
+        <*> getStdout stdoutH
+        <*> getStderr stderrH
+        <*> return (StreamingProcessHandle ph ec close)
 
 terminateStreamingProcess :: StreamingProcessHandle -> IO ()
 terminateStreamingProcess = terminateProcess . streamingProcessHandleRaw
