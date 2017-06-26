@@ -32,3 +32,7 @@ There is also a race involved: Sometimes it works.
 That happens when the code that does the actual pipe data shuffling (in `sourceProcessWithStreams`) has enough time to finish between the `forkIOWithUnmask` and the actual `waitForProcess` invocation (thus the `sleep 1` in my repro to make it always happen).
 
 And of course it happens only if the output produced by the spawned program is larger than the OS pipe buffer (64K on Linux). Otherwise the program writes into the pipe buffer, exits, `wait()` returns and the bug does not appear.
+
+The `System.Process` docs [even mention this](https://hackage.haskell.org/package/process-1.6.0.0/docs/System-Process.html#v:waitForProcess):
+
+> GHC Note: in order to call waitForProcess without blocking all the other threads in the system, you must compile the program with -threaded.
