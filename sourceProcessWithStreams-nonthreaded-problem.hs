@@ -5,6 +5,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# OPTIONS_GHC -Wall #-}
 
+import           Control.Applicative ((<|>))
 import           Control.Concurrent (forkIOWithUnmask)
 import           Control.Concurrent.Async
 import           Control.Concurrent.STM
@@ -18,10 +19,15 @@ import           Data.Conduit.Process hiding (sourceProcessWithStreams, streamin
 import           Data.Maybe (fromMaybe)
 import           Data.Streaming.Process hiding (streamingProcess)
 import           Data.Streaming.Process.Internal
+import           GHC.Conc.IO (threadWaitRead, threadWaitWrite)
 import           Say
 import           System.Exit
 import           System.IO (hClose)
 import qualified System.Process.Internals        as PI
+
+import qualified GHC.IO.Device as IODevice
+import           GHC.IO.Handle.Internals
+import           GHC.IO.Handle.Types
 
 streamingProcess :: (MonadIO m, InputSource stdin, OutputSink stdout, OutputSink stderr)
                => CreateProcess
@@ -37,12 +43,39 @@ streamingProcess cp = liftIO $ do
         , std_err = fromMaybe (std_err cp) stderrStream
         }
 
+    let waitForReadHandleChanged (Just h) = do
+          case h of
+            DuplexHandle{} -> error "shouldn't happen"
+            FileHandle _ mvar -> do
+              withHandle_' "waitForReadHandleChanged" h mvar $ \Handle__{ haDevice = device } ->
+                IODevice.ready device False 0 -- TODO This busy loops on GHC 8.0, see https://ghc.haskell.org/trac/ghc/ticket/13525
+        waitForReadHandleChanged Nothing = error "shouldn't happen"
+    let waitForWriteHandleChanged (Just h) = do
+          case h of
+            DuplexHandle{} -> error "shouldn't happen"
+            FileHandle _ mvar -> do
+              withHandle_' "waitForWriteHandleChanged" h mvar $ \Handle__{ haDevice = device } ->
+                IODevice.ready device True 0 -- TODO This busy loops on GHC 8.0, see https://ghc.haskell.org/trac/ghc/ticket/13525
+        waitForWriteHandleChanged Nothing = error "shouldn't happen"
+
+    let nonblockingWaitForProcessLoop :: IO ExitCode
+        nonblockingWaitForProcessLoop = do
+          mExitCode <- getProcessExitCode ph
+          case mExitCode of
+            Just exitCode -> return exitCode
+            Nothing -> do
+              _ <- runConcurrently $
+                    Concurrently (waitForWriteHandleChanged stdinH)
+                <|> Concurrently (waitForReadHandleChanged stdoutH)
+                <|> Concurrently (waitForReadHandleChanged stderrH)
+              nonblockingWaitForProcessLoop
+
     ec <- atomically newEmptyTMVar
     -- Apparently waitForProcess can throw an exception itself when
     -- delegate_ctlc is True, so to avoid this TMVar from being left empty, we
     -- capture any exceptions and store them as an impure exception in the
     -- TMVar
-    _ <- forkIOWithUnmask $ \_unmask -> try (waitForProcess ph)
+    _ <- forkIOWithUnmask $ \_unmask -> try nonblockingWaitForProcessLoop
         >>= atomically
           . putTMVar ec
           . either
@@ -89,7 +122,7 @@ sourceProcessWithStreams cp producerStdin consumerStdout consumerStderr = do
 main :: IO ()
 main = do
   (exitCode, stdout, stderr) <- sourceProcessWithStreams
-    (shell $ "sleep 1; yes | head --bytes=" ++ show (65536 + 1 :: Int)) -- 65536 == Linux pipe; buffer size; one byte more and it hangs
+    (shell $ "sleep 10; yes | head --bytes=" ++ show (65536 + 1 :: Int)) -- 65536 == Linux pipe; buffer size; one byte more and it hangs
     (return ()) -- stdin
     (CL.consume) -- stdout
     (CL.consume) -- stderr
