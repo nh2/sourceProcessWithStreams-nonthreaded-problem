@@ -3,6 +3,7 @@
 
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# OPTIONS_GHC -Wall #-}
 
 import           Control.Applicative ((<|>))
@@ -25,9 +26,12 @@ import           System.Exit
 import           System.IO (hClose)
 import qualified System.Process.Internals        as PI
 
+import           Data.Typeable (cast)
 import qualified GHC.IO.Device as IODevice
 import           GHC.IO.Handle.Internals
 import           GHC.IO.Handle.Types
+import           GHC.IO.FD (FD(fdFD))
+import           System.Posix.Types (Fd(Fd))
 
 streamingProcess :: (MonadIO m, InputSource stdin, OutputSink stdout, OutputSink stderr)
                => CreateProcess
@@ -47,15 +51,29 @@ streamingProcess cp = liftIO $ do
           case h of
             DuplexHandle{} -> error "shouldn't happen"
             FileHandle _ mvar -> do
-              withHandle_' "waitForReadHandleChanged" h mvar $ \Handle__{ haDevice = device } ->
-                IODevice.ready device False 0 -- TODO This busy loops on GHC 8.0, see https://ghc.haskell.org/trac/ghc/ticket/13525
+              withHandle_' "waitForReadHandleChanged" h mvar $ \Handle__{ haDevice = device, haType = haType } -> do
+                case haType of
+                  ClosedHandle -> return ()
+                  _ ->
+                    case cast device of
+                      Nothing -> error "waitForReadHandleChanged: device is not an FD!"
+                      Just (fd :: FD) -> do
+                        threadWaitRead (Fd (fdFD fd))
+                        return ()
         waitForReadHandleChanged Nothing = error "shouldn't happen"
     let waitForWriteHandleChanged (Just h) = do
           case h of
             DuplexHandle{} -> error "shouldn't happen"
             FileHandle _ mvar -> do
-              withHandle_' "waitForWriteHandleChanged" h mvar $ \Handle__{ haDevice = device } ->
-                IODevice.ready device True 0 -- TODO This busy loops on GHC 8.0, see https://ghc.haskell.org/trac/ghc/ticket/13525
+              withHandle_' "waitForWriteHandleChanged" h mvar $ \Handle__{ haDevice = device, haType = haType } -> do
+                case haType of
+                  ClosedHandle -> return ()
+                  _ ->
+                    case cast device of
+                      Nothing -> error "waitForWriteHandleChanged: device is not an FD!"
+                      Just (fd :: FD) -> do
+                        threadWaitWrite (Fd (fdFD fd))
+                        return ()
         waitForWriteHandleChanged Nothing = error "shouldn't happen"
 
     let nonblockingWaitForProcessLoop :: IO ExitCode
@@ -64,10 +82,10 @@ streamingProcess cp = liftIO $ do
           case mExitCode of
             Just exitCode -> return exitCode
             Nothing -> do
-              _ <- runConcurrently $
-                    Concurrently (waitForWriteHandleChanged stdinH)
-                <|> Concurrently (waitForReadHandleChanged stdoutH)
-                <|> Concurrently (waitForReadHandleChanged stderrH)
+              runConcurrently $
+                    Concurrently (waitForWriteHandleChanged stdinH >> say "A")
+                <|> Concurrently (waitForReadHandleChanged stdoutH >> say "B")
+                <|> Concurrently (waitForReadHandleChanged stderrH >> say "C")
               nonblockingWaitForProcessLoop
 
     ec <- atomically newEmptyTMVar
@@ -104,17 +122,18 @@ sourceProcessWithStreams :: CreateProcess
 sourceProcessWithStreams cp producerStdin consumerStdout consumerStderr = do
   putStrLn "BEFORE STREAMING PROCESS"
   (  (sinkStdin, closeStdin)
-   , (sourceStdout, closeStdout)
-   , (sourceStderr, closeStderr)
+   , (sourceStdout, closeStdout :: IO ())
+   , (sourceStderr, closeStderr :: IO ())
    , sph) <- streamingProcess cp
   liftIO (say "AFTER STREAMING PROCESS")
   (_, resStdout, resStderr) <-
     runConcurrently (
       (,,)
-      <$> Concurrently (say "STDIN" >> ((producerStdin $$ sinkStdin) `finally` closeStdin))
+      <$> Concurrently (say "STDIN" >> ((producerStdin $$ sinkStdin) `finally` (say "FINALLY 1" >> closeStdin)))
       <*> Concurrently (say "STDOUT" >> (sourceStdout  $$ consumerStdout))
       <*> Concurrently (say "STDERR" >> (sourceStderr  $$ consumerStderr)))
     `finally` (say "FINALLY" >> closeStdout >> closeStderr)
+    -- `finally` (say "FINALLY") -- TODO close again after debugging
     `onException` (say "TERMINATE" >> terminateStreamingProcess sph)
   ec <- waitForStreamingProcess sph
   return (ec, resStdout, resStderr)
