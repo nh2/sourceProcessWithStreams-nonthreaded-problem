@@ -3,11 +3,9 @@
 
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 {-# OPTIONS_GHC -Wall #-}
 
-import           Control.Applicative ((<|>))
-import           Control.Concurrent (forkIOWithUnmask)
+import           Control.Concurrent (forkIOWithUnmask, threadWaitRead)
 import           Control.Concurrent.Async
 import           Control.Concurrent.STM
 import           Control.Exception
@@ -18,20 +16,13 @@ import           Data.Conduit
 import qualified Data.Conduit.List as CL
 import           Data.Conduit.Process hiding (sourceProcessWithStreams, streamingProcess)
 import           Data.Maybe (fromMaybe)
-import           Data.Streaming.Process hiding (streamingProcess)
 import           Data.Streaming.Process.Internal
-import           GHC.Conc.IO (threadWaitRead, threadWaitWrite)
 import           Say
 import           System.Exit
 import           System.IO (hClose)
-import qualified System.Process.Internals        as PI
-
-import           Data.Typeable (cast)
-import qualified GHC.IO.Device as IODevice
-import           GHC.IO.Handle.Internals
-import           GHC.IO.Handle.Types
-import           GHC.IO.FD (FD(fdFD))
+import           System.Posix.IO (closeFd)
 import           System.Posix.Types (Fd(Fd))
+import qualified System.Process.Internals        as PI
 
 streamingProcess :: (MonadIO m, InputSource stdin, OutputSink stdout, OutputSink stderr)
                => CreateProcess
@@ -41,59 +32,34 @@ streamingProcess cp = liftIO $ do
         (getStdout, stdoutStream) = osStdStream
         (getStderr, stderrStream) = osStdStream
 
+    -- We use a pipe to the child process to determine when it's dead.
+    -- In Unix, when there is a Unix pipe between two processes, then
+    --   "When the child process terminates, its end of the pipe will be closed"
+    -- (see https://stackoverflow.com/questions/8976004/using-waitpid-or-sigaction/8976461#8976461)
+    -- See also http://tldp.org/LDP/lpg/node11.html about Unix pipes.
+    -- Making this decision based on a pipe FD is better than `waitpid()` because
+    -- we can use GHC IO manager's `threadWaitRead` function to wait in a
+    -- non-blocking, non-polling way.
+    (readFd, writeFd) <- ((\(r,w) -> (Fd r, Fd w))) <$> createPipeFd
+
     (stdinH, stdoutH, stderrH, ph) <- PI.createProcess_ "streamingProcess" cp
         { std_in = fromMaybe (std_in cp) stdinStream
         , std_out = fromMaybe (std_out cp) stdoutStream
         , std_err = fromMaybe (std_err cp) stderrStream
         }
 
-    let waitForReadHandleChanged (Just h) = do
-          case h of
-            DuplexHandle{} -> error "shouldn't happen"
-            FileHandle _ mvar -> do
-              withHandle_' "waitForReadHandleChanged" h mvar $ \Handle__{ haDevice = device, haType = haType } -> do
-                case haType of
-                  ClosedHandle -> return ()
-                  _ ->
-                    case cast device of
-                      Nothing -> error "waitForReadHandleChanged: device is not an FD!"
-                      Just (fd :: FD) -> do
-                        threadWaitRead (Fd (fdFD fd))
-                        return ()
-        waitForReadHandleChanged Nothing = error "shouldn't happen"
-    let waitForWriteHandleChanged (Just h) = do
-          case h of
-            DuplexHandle{} -> error "shouldn't happen"
-            FileHandle _ mvar -> do
-              withHandle_' "waitForWriteHandleChanged" h mvar $ \Handle__{ haDevice = device, haType = haType } -> do
-                case haType of
-                  ClosedHandle -> return ()
-                  _ ->
-                    case cast device of
-                      Nothing -> error "waitForWriteHandleChanged: device is not an FD!"
-                      Just (fd :: FD) -> do
-                        threadWaitWrite (Fd (fdFD fd))
-                        return ()
-        waitForWriteHandleChanged Nothing = error "shouldn't happen"
-
-    let nonblockingWaitForProcessLoop :: IO ExitCode
-        nonblockingWaitForProcessLoop = do
-          mExitCode <- getProcessExitCode ph
-          case mExitCode of
-            Just exitCode -> return exitCode
-            Nothing -> do
-              runConcurrently $
-                    Concurrently (waitForWriteHandleChanged stdinH >> say "A")
-                <|> Concurrently (waitForReadHandleChanged stdoutH >> say "B")
-                <|> Concurrently (waitForReadHandleChanged stderrH >> say "C")
-              nonblockingWaitForProcessLoop
+    -- Close pipe write end from parent process (we don't need it).
+    closeFd writeFd
+    -- When the child process closes its write end (e.g. by terminating),
+    -- we'll read EOF on our read end, and we wait for that to happen with
+    -- the `threadWaitRead readFd` below.
 
     ec <- atomically newEmptyTMVar
     -- Apparently waitForProcess can throw an exception itself when
     -- delegate_ctlc is True, so to avoid this TMVar from being left empty, we
     -- capture any exceptions and store them as an impure exception in the
     -- TMVar
-    _ <- forkIOWithUnmask $ \_unmask -> try nonblockingWaitForProcessLoop
+    _ <- forkIOWithUnmask $ \_unmask -> try (threadWaitRead readFd >> waitForProcess ph)
         >>= atomically
           . putTMVar ec
           . either
@@ -122,8 +88,8 @@ sourceProcessWithStreams :: CreateProcess
 sourceProcessWithStreams cp producerStdin consumerStdout consumerStderr = do
   putStrLn "BEFORE STREAMING PROCESS"
   (  (sinkStdin, closeStdin)
-   , (sourceStdout, closeStdout :: IO ())
-   , (sourceStderr, closeStderr :: IO ())
+   , (sourceStdout, closeStdout)
+   , (sourceStderr, closeStderr)
    , sph) <- streamingProcess cp
   liftIO (say "AFTER STREAMING PROCESS")
   (_, resStdout, resStderr) <-
@@ -133,7 +99,6 @@ sourceProcessWithStreams cp producerStdin consumerStdout consumerStderr = do
       <*> Concurrently (say "STDOUT" >> (sourceStdout  $$ consumerStdout))
       <*> Concurrently (say "STDERR" >> (sourceStderr  $$ consumerStderr)))
     `finally` (say "FINALLY" >> closeStdout >> closeStderr)
-    -- `finally` (say "FINALLY") -- TODO close again after debugging
     `onException` (say "TERMINATE" >> terminateStreamingProcess sph)
   ec <- waitForStreamingProcess sph
   return (ec, resStdout, resStderr)
@@ -141,7 +106,7 @@ sourceProcessWithStreams cp producerStdin consumerStdout consumerStderr = do
 main :: IO ()
 main = do
   (exitCode, stdout, stderr) <- sourceProcessWithStreams
-    (shell $ "sleep 10; yes | head --bytes=" ++ show (65536 + 1 :: Int)) -- 65536 == Linux pipe; buffer size; one byte more and it hangs
+    (shell $ "sleep 1; yes | head --bytes=" ++ show (65536 + 1 :: Int)) -- 65536 == Linux pipe; buffer size; one byte more and it hangs
     (return ()) -- stdin
     (CL.consume) -- stdout
     (CL.consume) -- stderr
